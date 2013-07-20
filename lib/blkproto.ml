@@ -29,6 +29,10 @@ let list l k =
   if not(List.mem_assoc k l)
   then `Error (Printf.sprintf "missing %s key" k)
   else `OK (List.assoc k l)
+let list_default l d k =
+  if not(List.mem_assoc k l)
+  then `OK d
+  else `OK (List.assoc k l)
 let int x = try `OK (int_of_string x) with _ -> `Error ("not an int: " ^ x)
 let int32 x = try `OK (Int32.of_string x) with _ -> `Error ("not an int32: " ^ x)
 let int64 x = try `OK (Int64.of_string x) with _ -> `Error ("not an int64: " ^ x)
@@ -178,39 +182,63 @@ end
 
 module RingInfo = struct
   type t = {
-    ref: int32;
+    refs: int list;
+    order: int;
     event_channel: int;
     protocol: Protocol.t;
   }
 
   let to_string t =
-    Printf.sprintf "{ ref = %ld; event_channel = %d; protocol = %s }"
-    t.ref t.event_channel (Protocol.to_string t.protocol)
+    Printf.sprintf "RingInfo.({ order = %d; refs = [ %s ]; event_channel = %d; protocol = %s })"
+    t.order (String.concat "; " (List.map string_of_int t.refs))
+    t.event_channel (Protocol.to_string t.protocol)
 
   let _ring_ref = "ring-ref"
   let _event_channel = "event-channel"
   let _protocol = "protocol"
 
-  let keys = [
+  let _max_ring_page_order = "max-ring-page-order"
+  let _ring_page_order = "ring-page-order"
+
+  let key_prefixes = [
     _ring_ref;
+    _ring_page_order;
     _event_channel;
     _protocol;
   ]
 
-  let to_assoc_list t = [
-    _ring_ref, Int32.to_string t.ref;
-    _event_channel, string_of_int t.event_channel;
-    _protocol, Protocol.to_string t.protocol
-  ]
+  let to_assoc_list t =
+    let rec print_refs acc next = function
+      | [] -> List.rev acc
+      | ref :: refs ->
+        let extra = if next = 0 then [ _ring_ref, string_of_int ref ] else [] in
+        let this = [ Printf.sprintf "%s%d" _ring_ref next, string_of_int ref ] in
+        print_refs (this @ extra @ acc) (next + 1) refs in
+    let refs = print_refs [] 0 t.refs in
+    refs @ ([
+      _ring_page_order, string_of_int t.order;
+      _event_channel, string_of_int t.event_channel;
+      _protocol, Protocol.to_string t.protocol
+    ])
 
   let of_assoc_list l =
-    list l _ring_ref >>= fun x -> int32 x
-    >>= fun ref ->
+    list_default l "1" _ring_page_order >>= fun x -> int x
+    >>= fun order ->
+    let rec lookup_refs acc next =
+      if next >= order
+      then `OK (List.rev acc)
+      else
+        let key = Printf.sprintf "%s%s" _ring_ref (if next = 0 then "" else string_of_int next) in
+        list l key >>= fun x -> int x
+        >>= fun ref ->
+        lookup_refs (ref :: acc) (next + 1) in
+    lookup_refs [] 0
+    >>= fun refs -> 
     list l _event_channel >>= fun x -> int x
     >>= fun event_channel ->
     list l _protocol >>= fun x -> Protocol.of_string x
     >>= fun protocol ->
-    `OK { ref; event_channel; protocol }
+    `OK { order; refs; event_channel; protocol }
 end
 
 module Hotplug = struct

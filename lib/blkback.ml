@@ -161,8 +161,8 @@ let init xg xe domid ring_info wait ops =
     | Protocol.Native -> Req.Proto_64.read_request, Req.Proto_64.total_size
   in
   let grants = List.map (fun r ->
-    { Gnttab.domid = domid; ref = Int32.to_int r })
-    [ ring_info.RingInfo.ref ] in
+    { Gnttab.domid = domid; ref = r })
+    ring_info.RingInfo.refs in
   match Gnttab.mapv xg grants true with
   | None ->
     failwith "Gnttab.mapv failed"

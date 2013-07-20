@@ -94,7 +94,7 @@ let plug (id:id) =
       with exn -> return default in
 
   (* The backend can advertise a multi-page ring: *)
-  lwt backend_max_ring_page_order = backend_read int_of_string 0 "max-ring-page-order" in
+  lwt backend_max_ring_page_order = backend_read int_of_string 0 RingInfo._max_ring_page_order in
   if backend_max_ring_page_order = 0
   then printf "Blkback can only use a single-page ring\n%!"
   else printf "Blkback advertises multi-page ring (size 2 ** %d pages)\n%!" backend_max_ring_page_order;
@@ -106,21 +106,12 @@ let plug (id:id) =
   lwt (gnts, ring, client) = alloc ~order:ring_page_order (vdev,backend_id) in
   let evtchn = Eventchn.bind_unbound_port h backend_id in
   let port = Eventchn.to_int evtchn in
-  let ring_info =
-    (* The new protocol writes (ring-refN = G) where N=0,1,2 *)
-    let rfs = snd(List.fold_left (fun (i, acc) g ->
-      i + 1, ((sprintf "ring-ref%d" i, string_of_int g) :: acc)
-    ) (0, []) gnts) in
-    if ring_page_order = 0
-    then [ "ring-ref", string_of_int (List.hd gnts) ] (* backwards compat *)
-    else [ "ring-page-order", string_of_int ring_page_order ] @ rfs in
-  let info = [
-    "event-channel", string_of_int port;
-    "protocol", "x86_64-abi";
-    "state", Device_state.(to_string Connected)
-  ] @ ring_info in
+  let ring_info = { RingInfo.order = ring_page_order; refs = gnts; event_channel = port; protocol = Protocol.X86_64 } in
+  let pairs =
+    State.(to_assoc_list Connected)
+    @ (RingInfo.to_assoc_list ring_info) in
   lwt () = Xs.(transaction (fun h ->
-    Lwt_list.iter_s (fun (k, v) -> write h (node k) v) info
+    Lwt_list.iter_s (fun (k, v) -> write h (node k) v) pairs
   )) in
   lwt () = Xs.(wait (fun h ->
     lwt state = read h (sprintf "%s/state" backend) in
