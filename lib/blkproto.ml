@@ -222,10 +222,10 @@ module RingInfo = struct
     ])
 
   let of_assoc_list l =
-    list_default l "1" _ring_page_order >>= fun x -> int x
+    list_default l "0" _ring_page_order >>= fun x -> int x
     >>= fun order ->
     let rec lookup_refs acc next =
-      if next >= order
+      if next >= (1 lsl order)
       then `OK (List.rev acc)
       else
         let key = Printf.sprintf "%s%s" _ring_ref (if next = 0 then "" else string_of_int next) in
