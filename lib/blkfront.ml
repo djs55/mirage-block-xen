@@ -58,11 +58,6 @@ let alloc ~order (num,domid) =
   let idx_size = Req.Proto_64.total_size in (* bigger than res *)
   let buf = Io_page.get_order order in
 
-  let buf' = Cstruct.of_bigarray buf in
-  for i = 0 to Cstruct.len buf' - 1 do
-    Cstruct.set_uint8 buf' i 0
-  done;
-
   let pages = Io_page.to_pages buf in
   lwt gnts = Gntshr.get_n (List.length pages) in
   List.iter (fun (gnt, page) -> Gntshr.grant_access ~domid ~writeable:true gnt page) (List.combine gnts pages);
