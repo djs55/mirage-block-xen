@@ -66,6 +66,8 @@ let rec diagnostic_thread ?previous t =
 
 
 let service_thread t =
+  let broken_slot = ref None in
+
   let rec loop_forever event =
     (* For all the requests on the ring, build up a list of
        writable and readonly grants. We will map and unmap these
@@ -100,6 +102,7 @@ let service_thread t =
     (* Prepare to map all grants on the ring: *)
     Ring.Rpc.Back.ack_requests t.ring
       (fun slot ->
+      try
         let open Req in
         let req = t.parse_req slot in
         let segs = Array.to_list req.segs in
@@ -116,6 +119,10 @@ let service_thread t =
           next_readonly_idx := !next_readonly_idx + (List.length grants);
           t.stats.Blkstats.total_requests <- t.stats.Blkstats.total_requests + 1;
         end;
+      with e ->
+        (* Remembering the broken slot allows us to analyse the contents below *)
+        broken_slot := Some slot;
+        raise e
       );
     (* -- at this point the ring slots may be overwritten *)
     let requests = List.rev !requests in
@@ -169,7 +176,27 @@ let service_thread t =
       lwt event = Activations.after t.evtchn event in
       loop_forever event
     end in
+  try_lwt
     loop_forever Activations.program_start
+  with e ->
+    printf "Exception in ring servicing thread: %s" (Printexc.to_string e);
+    lwt () = OS.Time.sleep 30. in
+    lwt () = match !broken_slot with
+      | None ->
+        printf "no broken slot\n%!";
+        return ()
+      | Some slot ->
+        begin try
+          printf "Attempting to re-parse ring slot:\n%!";
+          let req = t.parse_req slot in
+          printf "The slot look ok now. This means a race or a problem with barriers\n%!";
+          return ()
+        with e ->
+          printf "caught %s while re-parsing the ring slot\n%!" (Printexc.to_string e);
+          printf "This means the slot has been permanently corrupted.\n%!";
+          return ()
+        end in
+    fail e
 
 let init xg xe domid ring_info wait ops =
   printf "Blkback.init domid=%d ring=%s\n%!" domid (Blkproto.RingInfo.to_string ring_info);
