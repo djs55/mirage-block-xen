@@ -37,6 +37,11 @@ type transport = {
   gnts: Gnt.gntref list;
   evtchn: Eventchn.t;
   features: features;
+  stats: Blkstats.t;
+  wakers: (int64, Res.t Lwt.u) Hashtbl.t; (* id * wakener *)
+  pending_requests: Req.t Lwt_sequence.t;
+  mutable num_pending_requests: int;
+  transmitter_c: unit Lwt_condition.t;
 }
 
 type t = {
@@ -47,10 +52,22 @@ type t = {
 type id = string
 exception IO_error of string
 
+let h = Eventchn.init ()
+
+let rec diagnostic_thread ?previous t =
+  lwt () = OS.Time.sleep 10. in
+  let this = Blkstats.copy t.stats in
+  printf "%s\n%!" (Blkstats.to_string this);
+  if previous = Some this then begin
+    printf "<-- nothing changed in 10 seconds\n%!";
+    printf "%s\n%!" (Ring.Rpc.Front.to_string t.ring);
+    printf "triggering a notify\n%!";
+    Eventchn.notify h t.evtchn 
+  end;
+  diagnostic_thread ~previous:this t
+
 (** Set of active block devices *)
 let devices : (id, t) Hashtbl.t = Hashtbl.create 1
-
-let h = Eventchn.init ()
 
 (* Allocate a ring, given the vdev and backend domid *)
 let alloc ~order (num,domid) =
@@ -68,11 +85,71 @@ let alloc ~order (num,domid) =
   let client = Lwt_ring.Front.init Int64.to_string fring in
   return (gnts, fring, client)
 
+let poll t =
+  Ring.Rpc.Front.ack_responses t.ring (fun slot ->
+    let id, resp = Res.read_response slot in
+    try
+       let u = Hashtbl.find t.wakers id in
+       Hashtbl.remove t.wakers id;
+       Lwt.wakeup_later u resp;
+     with Not_found ->
+       let string_of_id = Int64.to_string in
+       printf "Block RX: ack (id = %s) wakener not found\n" (string_of_id id);
+       printf "    valid ids = [ %s ]\n%!" (String.concat "; " (List.map string_of_id (Hashtbl.fold (fun k _ acc -> k :: acc) t.wakers [])));
+    )
+
 (* Thread to poll for responses and activate wakeners *)
-let rec poll t =
-  Activations.wait t.evtchn >>
-  let () = Lwt_ring.Front.poll t.client (Res.read_response) in
-  poll t
+let receiver_thread t =
+  let rec loop_forever event =
+    lwt event = Activations.after t.evtchn event in
+(*  Printf.printf "Activations.wait %d\n%!" (Eventchn.to_int t.evtchn); *)
+(*  Printf.printf "polling ring\n%!"; *)
+    let () = poll t in
+    (* There might now be space in the ring: *)
+    if Ring.Rpc.Front.get_free_requests t.ring > 0
+    && t.num_pending_requests > 0 
+    then Lwt_condition.signal t.transmitter_c ();
+    loop_forever event in
+  loop_forever Activations.program_start
+
+let transmitter_thread t =
+  let rec loop_forever () =
+    (* We must wait if there are no pending requests (ie no work to do)
+       or if there are no free slots in the ring. *)
+    lwt () =
+      while_lwt (t.num_pending_requests = 0)
+                || (Ring.Rpc.Front.get_free_requests t.ring = 0) do
+      Lwt_condition.wait t.transmitter_c done in
+    (* Take as many available requests that will fit on the ring *)
+    for i = 1 to min t.num_pending_requests (Ring.Rpc.Front.get_free_requests t.ring) do
+      let req = Lwt_sequence.take_l t.pending_requests in
+      t.num_pending_requests <- t.num_pending_requests - 1;
+      assert (Ring.Rpc.Front.get_free_requests t.ring > 0);
+      let slot_id = Ring.Rpc.Front.next_req_id t.ring in
+      let slot = Ring.Rpc.Front.slot t.ring slot_id in
+      let (request_id: int64) = Req.Proto_64.write_request req slot in
+let notify = Ring.Rpc.Front.push_requests_and_check_notify t.ring in
+    if notify
+    then t.stats.Blkstats.notify_calls <- t.stats.Blkstats.notify_calls + 1
+    else t.stats.Blkstats.notify_skipped <- t.stats.Blkstats.notify_skipped + 1;
+    if notify
+    then Eventchn.notify h t.evtchn;
+      ()
+    done;
+    (* Push the batch and consider sending a notify *)
+    loop_forever () in
+  loop_forever ()
+
+let rpc t req =
+  let th, u = Lwt.task () in
+  Hashtbl.add t.t.wakers req.Req.id u;
+
+  Lwt.on_cancel th (fun () -> Hashtbl.remove t.t.wakers req.Req.id);
+
+  let (_: 'a Lwt_sequence.node) = Lwt_sequence.add_r req t.t.pending_requests in
+  t.t.num_pending_requests <- t.t.num_pending_requests + 1;
+  Lwt_condition.signal t.t.transmitter_c ();
+  th
 
 (* Given a VBD ID and a backend domid, construct a blkfront record *)
 let plug (id:id) =
@@ -130,10 +207,16 @@ let plug (id:id) =
   in
   printf "Blkfront features: barrier=%b removable=%b sector_size=%Lu sectors=%Lu\n%!" 
     features.barrier features.removable features.sector_size features.sectors;
-  Eventchn.unmask h evtchn;
-  let t = { backend_id; backend; ring; client; gnts; evtchn; features } in
-  (* Start the background poll thread *)
-  let _ = poll t in
+(*  Eventchn.unmask h evtchn; *)
+  let stats = Blkstats.zero in
+  let wakers = Hashtbl.create 32 in
+  let pending_requests = Lwt_sequence.create () in
+  let num_pending_requests = 0 in
+  let transmitter_c = Lwt_condition.create () in
+  let t = { backend_id; backend; ring; client; gnts; evtchn; features; stats; pending_requests; num_pending_requests; transmitter_c; wakers } in
+  let _ = receiver_thread t in
+  let _ = transmitter_thread t in
+  let _ = diagnostic_thread t in
   return t
 
 (* Unplug shouldn't block, although the Xen one might need to due
@@ -170,14 +253,18 @@ let rec write_page t offset page =
             let id = Int64.of_int32 gref in
             let segs =[| { Req.gref; first_sector=0; last_sector=7 } |] in
             let req = Req.({op=Some Req.Write; handle=t.vdev; id; sector; segs}) in
-            lwt res = Lwt_ring.Front.push_request_and_wait t.t.client
-              (fun () -> Eventchn.notify h t.t.evtchn)
-              (Req.Proto_64.write_request req) in
+            lwt res = rpc t req in
             let open Res in
             Res.(match res.st with
-            | Some Error -> fail (IO_error "write")
-            | Some Not_supported -> fail (IO_error "unsupported")
-            | None -> fail (IO_error "unknown error")
+            | Some Error ->
+              printf "IO error\n%!";
+              fail (IO_error "write")
+            | Some Not_supported ->
+              printf "unsupported\n%!";
+              fail (IO_error "unsupported")
+            | None ->
+              printf "unknown\n%!";
+              fail (IO_error "unknown error")
             | Some OK -> return ())
           )
       )
@@ -237,6 +324,8 @@ module Single_request = struct
       )
 end
 
+exception Timeout
+
 (* Issues a single request to read from [start_sector + start_offset] to [end_sector - end_offset]
    where: [start_sector] and [end_sector] are page-aligned; and the total number of pages will fit
    in a single request. *)
@@ -266,15 +355,30 @@ let read_single_request t r =
 		  ) (Array.of_list rs) in
 		let id = Int64.of_int (List.hd rs) in
 		let req = Req.({ op=Some Read; handle=t.vdev; id; sector=r.start_sector; segs }) in
-		lwt res = Lwt_ring.Front.push_request_and_wait t.t.client
-		  (fun () -> Eventchn.notify h t.t.evtchn)
-		  (Req.Proto_64.write_request req) in
+		lwt res = rpc t req in
+(*
+                let timeout =
+                  lwt () = OS.Time.sleep 30. in
+                  printf "timeout\n%!";
+                  fail Timeout in
+                lwt res = Lwt.pick [ res; timeout ] in
+*)
 		let open Res in
 		match res.st with
-		  | Some Error -> fail (IO_error "read")
-		  | Some Not_supported -> fail (IO_error "unsupported")
-		  | None -> fail (IO_error "unknown error")
+		  | Some Error ->
+                    printf "read error\n%!";
+                    t.t.stats.Blkstats.total_error <- t.t.stats.Blkstats.total_error + 1;
+                    fail (IO_error "read")
+		  | Some Not_supported ->
+                    printf "unsupported\n%!";
+                    t.t.stats.Blkstats.total_error <- t.t.stats.Blkstats.total_error + 1;
+                    fail (IO_error "unsupported")
+		  | None ->
+                    printf "unknown\n%!";
+                    t.t.stats.Blkstats.total_error <- t.t.stats.Blkstats.total_error + 1;
+                    fail (IO_error "unknown error")
 		  | Some OK ->
+                    t.t.stats.Blkstats.total_ok <- t.t.stats.Blkstats.total_ok + 1;
 		    (* Get the pages, and convert them into Istring views *)
 		    return (Lwt_stream.of_list (List.rev (snd (List.fold_left
 		      (fun (i, acc) page ->
