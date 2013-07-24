@@ -35,6 +35,7 @@ type ('a, 'b) t = {
   ops :   ops;
   parse_req : Cstruct.t -> Req.t;
   wait:   Eventchn.t -> unit Lwt.t;
+  stats:  Blkstats.t;
 }
 
 let page_size = 4096
@@ -52,6 +53,17 @@ module Opt = struct
 end
 
 let empty = Bigarray.Array1.create Bigarray.char Bigarray.c_layout 0
+
+let rec diagnostic_thread ?previous t =
+  lwt () = OS.Time.sleep 10. in
+  let this = Blkstats.copy t.stats in
+  printf "%s\n%!" (Blkstats.to_string this);
+  if previous = Some this then begin
+    printf "<-- nothing changed in 10 seconds\n%!";
+    printf "%s\n%!" (Ring.Rpc.Back.to_string t.ring);
+  end;
+  diagnostic_thread ~previous:this t
+
 
 let service_thread t =
   let rec loop_forever () =
@@ -95,12 +107,14 @@ let service_thread t =
           let grants = grants_of_segments segs in
           writable_grants := !writable_grants @ grants;
           requests := (req, !next_writable_idx) :: !requests;
-          next_writable_idx := !next_writable_idx + (List.length grants)
+          next_writable_idx := !next_writable_idx + (List.length grants);
+          t.stats.Blkstats.total_requests <- t.stats.Blkstats.total_requests + 1;
         end else begin
           let grants = grants_of_segments segs in
           readonly_grants := !readonly_grants @ grants;
           requests := (req, !next_readonly_idx) :: !requests;
-          next_readonly_idx := !next_readonly_idx + (List.length grants)
+          next_readonly_idx := !next_readonly_idx + (List.length grants);
+          t.stats.Blkstats.total_requests <- t.stats.Blkstats.total_requests + 1;
         end;
       );
     (* -- at this point the ring slots may be overwritten *)
@@ -135,6 +149,7 @@ let service_thread t =
           let slot = Ring.Rpc.Back.(slot t.ring (next_res_id t.ring)) in
           (* These responses aren't visible until pushed (below) *)
           write_response (request.Req.id, {op=request.Req.op; st=Some OK}) slot;
+          t.stats.Blkstats.total_ok <- t.stats.Blkstats.total_ok + 1;
           return ()
         ) requests in
 
@@ -145,6 +160,9 @@ let service_thread t =
       let () = try Opt.iter (Gnttab.unmap_exn t.xg) writable_mapping with e -> printf "Failed to unmap: %s\n%!" (Printexc.to_string e) in
       (* Make the responses visible to the frontend *)
       let notify = Ring.Rpc.Back.push_responses_and_check_notify t.ring in
+      if notify
+      then t.stats.Blkstats.notify_calls <- t.stats.Blkstats.notify_calls + 1
+      else t.stats.Blkstats.notify_skipped <- t.stats.Blkstats.notify_skipped + 1;
       if notify then Eventchn.notify t.xe t.evtchn;
       return () in
 
@@ -152,8 +170,8 @@ let service_thread t =
     loop_forever () in
   loop_forever ()
 
-
 let init xg xe domid ring_info wait ops =
+  printf "Blkback.init domid=%d ring=%s\n%!" domid (Blkproto.RingInfo.to_string ring_info);
   let evtchn = Eventchn.bind_interdomain xe domid ring_info.RingInfo.event_channel in
   let parse_req, idx_size = match ring_info.RingInfo.protocol with
     | Protocol.X86_64 -> Req.Proto_64.read_request, Req.Proto_64.total_size
@@ -165,12 +183,20 @@ let init xg xe domid ring_info wait ops =
     ring_info.RingInfo.refs in
   match Gnttab.mapv xg grants true with
   | None ->
+    printf "Gnttab.mapv failed\n%!";
     failwith "Gnttab.mapv failed"
   | Some mapping ->
     let buf = Gnttab.Local_mapping.to_buf mapping in
-    let ring = Ring.Rpc.of_buf ~buf:(Io_page.to_cstruct buf) ~idx_size ~name:"blkback" in
+    let c = Io_page.to_cstruct buf in
+    printf "Mapped ring size = %d\n%!" (Cstruct.len c);
+    let ring = Ring.Rpc.of_buf ~buf:c ~idx_size ~name:"blkback" in
     let ring = Ring.Rpc.Back.init ring in
-    let t = { domid; xg; xe; evtchn; ops; wait; parse_req; ring } in
+
+    let stats = Blkstats.zero in
+    let t = { domid; xg; xe; evtchn; ops; wait; parse_req; ring; stats } in
+    let diagnostic_th = diagnostic_thread t in
     let th = service_thread t in
-    on_cancel th (fun () -> let () = Gnttab.unmap_exn xg mapping in ());
+    on_cancel th (fun () ->
+      let () = Gnttab.unmap_exn xg mapping in
+      Lwt.cancel diagnostic_th);
     th
