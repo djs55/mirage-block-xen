@@ -85,18 +85,28 @@ let alloc ~order (num,domid) =
   let client = Lwt_ring.Front.init Int64.to_string fring in
   return (gnts, fring, client)
 
-let poll t =
-  Ring.Rpc.Front.ack_responses t.ring (fun slot ->
-    let id, resp = Res.read_response slot in
-    try
-       let u = Hashtbl.find t.wakers id in
-       Hashtbl.remove t.wakers id;
-       Lwt.wakeup_later u resp;
-     with Not_found ->
-       let string_of_id = Int64.to_string in
-       printf "Block RX: ack (id = %s) wakener not found\n" (string_of_id id);
-       printf "    valid ids = [ %s ]\n%!" (String.concat "; " (List.map string_of_id (Hashtbl.fold (fun k _ acc -> k :: acc) t.wakers [])));
-    )
+let rec poll t =
+  try
+    Ring.Rpc.Front.ack_responses t.ring (fun slot ->
+      let id, resp = Res.read_response slot in
+      try
+         let u = Hashtbl.find t.wakers id in
+         Hashtbl.remove t.wakers id;
+         Lwt.wakeup_later u resp;
+       with Not_found ->
+         let string_of_id = Int64.to_string in
+         printf "Block RX: ack (id = %s) wakener not found\n" (string_of_id id);
+         printf "    valid ids = [ %s ]\n%!" (String.concat "; " (List.map string_of_id (Hashtbl.fold (fun k _ acc -> k :: acc) t.wakers [])));
+         printf "%s\n%!" (Ring.Rpc.Front.to_string t.ring);
+
+      )
+  with e ->
+(*
+    printf "receiving responses: %s\n%!" (Printexc.to_string e);
+    printf "%s\n%!" (Ring.Rpc.Front.to_string t.ring);
+    raise e
+*)
+    poll t
 
 (* Thread to poll for responses and activate wakeners *)
 let receiver_thread t =
@@ -140,8 +150,13 @@ let notify = Ring.Rpc.Front.push_requests_and_check_notify t.ring in
     loop_forever () in
   loop_forever ()
 
+let next_request_id = ref 0L
+
 let rpc t req =
   let th, u = Lwt.task () in
+  let req = { req with Req.id = !next_request_id } in
+  next_request_id := Int64.succ !next_request_id;
+
   Hashtbl.add t.t.wakers req.Req.id u;
 
   Lwt.on_cancel th (fun () -> Hashtbl.remove t.t.wakers req.Req.id);
