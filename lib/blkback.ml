@@ -66,7 +66,7 @@ let rec diagnostic_thread ?previous t =
 
 
 let service_thread t =
-  let rec loop_forever () =
+  let rec loop_forever event =
     (* For all the requests on the ring, build up a list of
        writable and readonly grants. We will map and unmap these
        as a batch. *)
@@ -126,7 +126,6 @@ let service_thread t =
     let writable_buffer = Opt.(default empty (map Gnttab.Local_mapping.to_buf writable_mapping)) in
     let readonly_buffer = Opt.(default empty (map Gnttab.Local_mapping.to_buf readonly_mapping)) in
 
-    let _ = (* perform everything else in a background thread *)
       (* Handle each request in order *)
       lwt () = Lwt_list.iter_s
         (fun (request, page_offset) ->
@@ -164,15 +163,18 @@ let service_thread t =
       then t.stats.Blkstats.notify_calls <- t.stats.Blkstats.notify_calls + 1
       else t.stats.Blkstats.notify_skipped <- t.stats.Blkstats.notify_skipped + 1;
       if notify then Eventchn.notify t.xe t.evtchn;
-      return () in
-
-    lwt () = Activations.wait t.evtchn in
-    loop_forever () in
-  loop_forever ()
+    if Ring.Rpc.Back.more_to_do t.ring then begin
+      loop_forever event;
+    end else begin
+      lwt event = Activations.after t.evtchn event in
+      loop_forever event
+    end in
+    loop_forever Activations.program_start
 
 let init xg xe domid ring_info wait ops =
   printf "Blkback.init domid=%d ring=%s\n%!" domid (Blkproto.RingInfo.to_string ring_info);
   let evtchn = Eventchn.bind_interdomain xe domid ring_info.RingInfo.event_channel in
+  Eventchn.unmask xe evtchn;
   let parse_req, idx_size = match ring_info.RingInfo.protocol with
     | Protocol.X86_64 -> Req.Proto_64.read_request, Req.Proto_64.total_size
     | Protocol.X86_32 -> Req.Proto_32.read_request, Req.Proto_32.total_size
