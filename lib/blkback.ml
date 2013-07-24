@@ -68,7 +68,9 @@ let rec diagnostic_thread ?previous t =
 let service_thread t =
   let broken_slot = ref None in
 
-  let rec loop_forever event =
+  let rec loop_forever event spin_counter =
+    if spin_counter > 100000 then failwith "Spinning forever";
+
     (* For all the requests on the ring, build up a list of
        writable and readonly grants. We will map and unmap these
        as a batch. *)
@@ -171,13 +173,13 @@ let service_thread t =
       else t.stats.Blkstats.notify_skipped <- t.stats.Blkstats.notify_skipped + 1;
       if notify then Eventchn.notify t.xe t.evtchn;
     if Ring.Rpc.Back.more_to_do t.ring then begin
-      loop_forever event;
+      loop_forever event (spin_counter + 1);
     end else begin
       lwt event = Activations.after t.evtchn event in
-      loop_forever event
+      loop_forever event 0
     end in
   try_lwt
-    loop_forever Activations.program_start
+    loop_forever Activations.program_start 0
   with e ->
     printf "Exception in ring servicing thread: %s" (Printexc.to_string e);
     lwt () = OS.Time.sleep 30. in
